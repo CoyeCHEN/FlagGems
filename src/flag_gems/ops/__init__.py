@@ -995,6 +995,7 @@ from flag_gems.ops.vdot import vdot
 from flag_gems.ops.vector_norm import vector_norm
 from flag_gems.ops.view_as_complex import view_as_complex
 from flag_gems.ops.view_copy import view_copy
+from flag_gems.ops.vsplit import vsplit
 from flag_gems.ops.vstack import vstack
 from flag_gems.ops.w8a8_block_fp8_matmul import w8a8_block_fp8_matmul
 from flag_gems.ops.weight_int8pack_mm import weight_int8pack_mm
@@ -2075,6 +2076,7 @@ __all__ = [
     "vector_norm",
     "view_as_complex",
     "view_copy",
+    "vsplit",
     "vstack",
     "w8a8_block_fp8_matmul",
     "weight_int8pack_mm",
