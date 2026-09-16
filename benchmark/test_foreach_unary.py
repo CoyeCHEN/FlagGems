@@ -17,7 +17,9 @@ from typing import Generator
 import pytest
 import torch
 
-from . import base
+from flag_gems.ops._foreach_unary import UNARY_OPS
+
+from . import base, consts
 
 
 class ForeachUnaryBenchmark(base.Benchmark):
@@ -27,6 +29,14 @@ class ForeachUnaryBenchmark(base.Benchmark):
     just the size of one: a per-tensor implementation costs one launch each, so
     its overhead grows with list length. Each shape below is therefore expanded
     into a list of tensors, and the list length is varied alongside the shape.
+
+    The shapes come from the `ForeachUnaryBenchmark` entry in core_shapes.yaml,
+    which `base.Benchmark.set_shapes` reaches through the MRO once an operator
+    name is absent from that file. Relying on the class entry rather than one
+    entry per operator is deliberate: the sixty operator names here would
+    otherwise each need a near-identical block, and a missing one would silently
+    fall through to the shared `Benchmark` default of 1024**3 elements, which at
+    sixteen tensors per call reserves 64 GiB.
     """
 
     # Kept modest on purpose: every shape is multiplied by LIST_LENGTH, so the
@@ -80,30 +90,62 @@ class ForeachUnaryListLengthBenchmark(ForeachUnaryBenchmark):
                 yield (tensors,)
 
 
-BENCH_OPS = ["abs", "neg", "sin", "exp", "sqrt", "round", "sigmoid"]
+# Every operator the shared executor registers, so that the benchmark count
+# tracks the registration count instead of drifting from it. The names are the
+# table keys rather than a second hand-written list for the same reason.
+BENCH_OPS = sorted(UNARY_OPS)
 
 
-@pytest.mark.parametrize("name", BENCH_OPS)
+def _params(inplace: bool):
+    """One `pytest.param` per operator, carrying that operator's own marker.
+
+    `parametrize` alone generates the cases but attaches no marker, so
+    `pytest -m underscore_foreach_abs` selects nothing and
+    `benchmark/conftest.py` falls back to the node id when it derives the
+    operator id for the recorded result. Attaching the marker per parameter is
+    what makes each generated case addressable as its own operator; the marker
+    name is the operators.yaml id, which prefixes `underscore_` for the leading
+    underscore in `aten::_foreach_*`.
+    """
+    suffix = "_" if inplace else ""
+    return [
+        pytest.param(
+            name, marks=getattr(pytest.mark, f"underscore_foreach_{name}{suffix}")
+        )
+        for name in BENCH_OPS
+    ]
+
+
+@pytest.mark.parametrize("name", _params(inplace=False))
 def test_perf_foreach_unary(name):
     bench = ForeachUnaryBenchmark(
         op_name=f"foreach_{name}",
         torch_op=getattr(torch, f"_foreach_{name}"),
-        dtypes=[torch.float16, torch.float32, torch.bfloat16],
+        dtypes=consts.FLOAT_DTYPES,
     )
     bench.run()
 
 
-@pytest.mark.parametrize("name", BENCH_OPS)
+@pytest.mark.parametrize("name", _params(inplace=True))
 def test_perf_foreach_unary_(name):
     bench = ForeachUnaryBenchmark(
         op_name=f"foreach_{name}_",
         torch_op=getattr(torch, f"_foreach_{name}_"),
-        dtypes=[torch.float16, torch.float32, torch.bfloat16],
+        dtypes=consts.FLOAT_DTYPES,
+        is_inplace=True,
     )
     bench.run()
 
 
-@pytest.mark.parametrize("name", ["abs", "sin"])
+# The list-length sweep is an extra axis over operators already covered above,
+# so it carries the same markers rather than introducing new operator ids.
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param("abs", marks=pytest.mark.underscore_foreach_abs),
+        pytest.param("sin", marks=pytest.mark.underscore_foreach_sin),
+    ],
+)
 def test_perf_foreach_unary_list_length(name):
     """The axis where the shared executor pays off, and where a regression back
     to per-tensor launches shows up first."""
