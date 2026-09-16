@@ -314,7 +314,7 @@ def _ctc_loss_backward_out(
     out: Optional[torch.Tensor] = None,
 ):
     """Out variant of _ctc_loss_backward."""
-    logger.debug("GEMS _CTC_LOSS_BACKWARD OUT")
+    logger.debug("GEMS _CTC_LOSS_BACKWARD_OUT")
 
     grad_log_probs = _ctc_loss_backward(
         grad,
