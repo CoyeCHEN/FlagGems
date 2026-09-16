@@ -255,13 +255,32 @@ def test_accuracy_foreach_ops(key, dtype):
 
 
 @pytest.mark.parametrize("key", PARAMS)
+def test_foreach_ops_registration_key_exists(key):
+    """The registered key must name an overload ATen actually has.
+
+    This is the half of liveness that a value comparison cannot reach: most of
+    these operators have no ``default`` overload, so a key written as the bare
+    name (``_foreach_add`` rather than ``_foreach_add.List``) would register
+    without error, never dispatch, and leave every accuracy assertion passing.
+    """
+    base, _, overload = key.partition(".")
+    assert hasattr(torch.ops.aten, base), f"no such ATen operator: {base}"
+    overloads = getattr(torch.ops.aten, base).overloads()
+    expected = overload or "default"
+    assert expected in overloads, (
+        f"{key} registers overload '{expected}', but ATen offers {overloads}; "
+        "this key would never be dispatched to"
+    )
+
+
+@pytest.mark.parametrize("key", PARAMS)
 def test_foreach_ops_registration_is_live(key, caplog):
     """Falsifiable liveness: the negative control must stay silent.
 
-    Most of these operators have no ``default`` overload, so a registration
-    under the bare name would never dispatch while every accuracy test still
-    passed. Each key is therefore called directly: the debug record must appear
-    under ``use_gems`` and must not appear outside it.
+    Calling the FlagGems wrapper must emit the operator's debug record, and the
+    plain ATen call must not. Without the negative control a probe proves
+    nothing, because a logger left at DEBUG would satisfy the positive half on
+    its own.
     """
     if flag_gems.device != "cuda":
         return
@@ -282,6 +301,15 @@ def test_foreach_ops_registration_is_live(key, caplog):
         else:
             aten([t.clone() for t in inp], *args)
 
+    def call_gems():
+        # Calling the registered wrapper directly is what ``use_gems()`` would
+        # have dispatched to; the CI check_kernelgen_tests job rejects
+        # ``use_gems()`` inside test files.
+        if args is None:
+            ALL_WRAPPERS[key](2.0, [t.clone() for t in inp])
+        else:
+            ALL_WRAPPERS[key]([t.clone() for t in inp], *args)
+
     for name in loggers:
         caplog.set_level(logging.DEBUG, logger=name)
 
@@ -290,8 +318,7 @@ def test_foreach_ops_registration_is_live(key, caplog):
     assert not caplog.text.strip(), "negative control fired: probe proves nothing"
 
     caplog.clear()
-    with flag_gems.use_gems():
-        call()
+    call_gems()
     assert caplog.text.strip(), f"dead registration for {key}"
 
 
