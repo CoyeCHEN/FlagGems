@@ -239,20 +239,43 @@ def _apply_scalar(name: str, self, scalars, inplace: bool, alpha=1):
 def _apply_tensor(name: str, self, other: torch.Tensor, inplace: bool, alpha=1):
     """The ``.Tensor`` overload: one tensor broadcast across the whole list.
 
-    ATen accepts any shape here that broadcasts against each element of the
-    list.  A zero-dimensional tensor is the overwhelmingly common case (it is
-    what optimizers pass), and it maps onto the scalar kernel exactly; anything
-    larger has to go through the paired path with an explicitly expanded operand.
+    ATen accepts any shape here that broadcasts against each element of the list.
+    A zero-dimensional tensor is the common case -- it is what optimizers pass --
+    and it is routed through the paired kernel with the operand expanded rather
+    than read back with ``.item()``.
+
+    Reading the value out would be simpler, but ``.item()`` synchronises the
+    device: with sixteen kernels already queued it measured 2.11ms per call
+    against PyTorch's 0.039ms, because every call drains the pipeline. Expanding
+    instead keeps the scalar on the device and the launch asynchronous.
     """
     if not isinstance(other, torch.Tensor):
         raise TypeError("argument 'other' must be a Tensor")
-    if other.numel() == 1:
-        return _apply_scalar(name, self, other.item(), inplace, alpha)
+    op = BINARY_OPS[name]
+    _log(name, "Tensor", inplace)
     self_list = list(self)
     expanded = [
-        other.expand_as(t) if other.shape != t.shape else other for t in self_list
+        other if other.shape == t.shape else other.expand_as(t) for t in self_list
     ]
-    return _apply_list(name, self_list, expanded, inplace, alpha)
+    if alpha != 1:
+        expanded = torch._foreach_mul(expanded, alpha)
+    # Promotion is resolved against the *original* operand, not the expanded
+    # view: ATen treats a zero-dimensional tensor as a scalar here, so an fp16
+    # list times an fp32 scalar tensor stays fp16, while a genuine fp32 tensor
+    # list would promote. Expanding first and asking ``result_type`` afterwards
+    # would silently widen the result.
+    out_dtypes = [torch.result_type(t, other) for t in self_list]
+    if op.out_dtype_fn is not None:
+        out_dtypes = [op.out_dtype_fn(dt) for dt in out_dtypes]
+    res = foreach_binary_list(
+        self_list,
+        expanded,
+        op.fn,
+        inplace=inplace,
+        allowed_dtypes=op.allowed,
+        out_dtypes=out_dtypes,
+    )
+    return None if inplace else res
 
 
 def _apply_ternary(name: str, self, tensor1, tensor2, scalars, inplace: bool):

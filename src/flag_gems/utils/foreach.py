@@ -688,26 +688,38 @@ def foreach_binary_list(
     inplace: bool = False,
     allowed_dtypes: Optional[frozenset] = None,
     out_dtype_fn: Optional[Callable[[torch.dtype], torch.dtype]] = None,
+    out_dtypes: Optional[Sequence[torch.dtype]] = None,
 ) -> List[torch.Tensor]:
     """``self[i] <op> other[i]`` for every position, one launch per group.
 
     Both lists are paired position by position, so they must have equal length;
     ATen raises rather than broadcasting across the list.
+
+    ``out_dtypes`` lets the caller pin the result dtype per position. The
+    ``.Tensor`` overloads need it: their operand is a scalar tensor expanded to
+    the list's shape, and promoting against the *expanded* view would widen an
+    fp16 list to fp32, where ATen keeps fp16 because a zero-dimensional tensor
+    counts as a scalar.
     """
     self = check_tensor_list(self)
     other = check_tensor_list(other)
     _check_same_length(self, other, "tensor list")
+    if out_dtypes is not None:
+        _check_same_length(self, out_dtypes, "output dtype list")
     _STATS.reset()
 
     results: List[torch.Tensor] = []
     buckets: Dict[Tuple[Any, torch.dtype, torch.dtype], Tuple[List, List, List]] = {}
     writebacks: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
-    for a, b in zip(self, other):
+    for i, (a, b) in enumerate(zip(self, other)):
         check_dtype_supported(a.dtype, allowed_dtypes)
-        out_dtype = _result_dtype(a, b)
-        if out_dtype_fn is not None:
-            out_dtype = out_dtype_fn(out_dtype)
+        if out_dtypes is not None:
+            out_dtype = out_dtypes[i]
+        else:
+            out_dtype = _result_dtype(a, b)
+            if out_dtype_fn is not None:
+                out_dtype = out_dtype_fn(out_dtype)
         src_a = _dense(a)
         src_b = _dense(b)
         if inplace:
