@@ -292,6 +292,127 @@ def foreach_unary_c2c_kernel(
     tl.store(out_ptr + 2 * idx + 1, out_im.to(R_DT), mask=mask)
 
 
+@triton.jit
+def foreach_binary_kernel(
+    meta_ptr,
+    fn: tl.constexpr,
+    NT: tl.constexpr,
+    A_DT: tl.constexpr,
+    B_DT: tl.constexpr,
+    OUT_DT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """One launch, ``NT`` tensors, two tensor inputs per element.
+
+    ``meta_ptr`` layout, all int64::
+
+        [0,      NT)     first input pointers
+        [NT,   2*NT)     second input pointers
+        [2*NT, 3*NT)     output pointers
+        [3*NT, 4*NT)     element counts
+
+    The second operand is read with its *own* pointer rather than being folded
+    into the first, which is what makes ``.List`` correct for tensors whose
+    strides differ: the two lists are paired position by position, and each
+    element count is that pair's own. A unary operator can get away with flat
+    traversal of a non-contiguous tensor because the element *set* is unchanged,
+    but pairing two differently-strided tensors by flat index would silently
+    match up the wrong elements, so both sides are staged to dense form by the
+    caller before they reach here.
+    """
+    t = tl.program_id(0)
+    offset = tl.program_id(1) * BLOCK
+
+    a_ptr = tl.load(meta_ptr + t).to(tl.pointer_type(A_DT))
+    b_ptr = tl.load(meta_ptr + NT + t).to(tl.pointer_type(B_DT))
+    out_ptr = tl.load(meta_ptr + 2 * NT + t).to(tl.pointer_type(OUT_DT))
+    n_elements = tl.load(meta_ptr + 3 * NT + t)
+
+    idx = offset + tl.arange(0, BLOCK)
+    mask = idx < n_elements
+    a = tl.load(a_ptr + idx, mask=mask, other=0)
+    b = tl.load(b_ptr + idx, mask=mask, other=0)
+    tl.store(out_ptr + idx, fn(a.to(OUT_DT), b.to(OUT_DT)).to(OUT_DT), mask=mask)
+
+
+@triton.jit
+def foreach_binary_scalar_kernel(
+    meta_ptr,
+    scalar_ptr,
+    fn: tl.constexpr,
+    NT: tl.constexpr,
+    A_DT: tl.constexpr,
+    OUT_DT: tl.constexpr,
+    S_DT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """``NT`` tensors against one scalar *each*.
+
+    ``meta_ptr`` layout matches the unary kernel (in / out / counts); the
+    per-tensor scalars live in their own ``scalar_ptr`` array indexed by tensor.
+
+    A single ``ScalarList`` array covers both the ``.Scalar`` and
+    ``.ScalarList`` overloads -- ``.Scalar`` simply broadcasts one value into
+    every slot on the host side. Passing the scalars through device memory
+    rather than as kernel arguments keeps one compiled kernel for any list
+    length, which is the whole point of the shared executor.
+    """
+    t = tl.program_id(0)
+    offset = tl.program_id(1) * BLOCK
+
+    a_ptr = tl.load(meta_ptr + t).to(tl.pointer_type(A_DT))
+    out_ptr = tl.load(meta_ptr + NT + t).to(tl.pointer_type(OUT_DT))
+    n_elements = tl.load(meta_ptr + 2 * NT + t)
+    s = tl.load(scalar_ptr + t).to(S_DT)
+
+    idx = offset + tl.arange(0, BLOCK)
+    mask = idx < n_elements
+    a = tl.load(a_ptr + idx, mask=mask, other=0)
+    tl.store(out_ptr + idx, fn(a.to(OUT_DT), s.to(OUT_DT)).to(OUT_DT), mask=mask)
+
+
+@triton.jit
+def foreach_ternary_kernel(
+    meta_ptr,
+    scalar_ptr,
+    fn: tl.constexpr,
+    NT: tl.constexpr,
+    A_DT: tl.constexpr,
+    OUT_DT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """``NT`` tensors, three tensor inputs and one per-tensor scalar.
+
+    ``meta_ptr`` layout, all int64::
+
+        [0,      NT)     self pointers
+        [NT,   2*NT)     tensor1 pointers
+        [2*NT, 3*NT)     tensor2 pointers
+        [3*NT, 4*NT)     output pointers
+        [4*NT, 5*NT)     element counts
+
+    This serves ``addcmul``/``addcdiv`` (``self + value * t1 <op> t2``) and the
+    ``lerp`` weight forms; the scalar array is the ``value``/``weight``
+    argument, broadcast on the host when the overload supplies a single value.
+    """
+    t = tl.program_id(0)
+    offset = tl.program_id(1) * BLOCK
+
+    a_ptr = tl.load(meta_ptr + t).to(tl.pointer_type(A_DT))
+    b_ptr = tl.load(meta_ptr + NT + t).to(tl.pointer_type(A_DT))
+    c_ptr = tl.load(meta_ptr + 2 * NT + t).to(tl.pointer_type(A_DT))
+    out_ptr = tl.load(meta_ptr + 3 * NT + t).to(tl.pointer_type(OUT_DT))
+    n_elements = tl.load(meta_ptr + 4 * NT + t)
+    s = tl.load(scalar_ptr + t)
+
+    idx = offset + tl.arange(0, BLOCK)
+    mask = idx < n_elements
+    a = tl.load(a_ptr + idx, mask=mask, other=0).to(OUT_DT)
+    b = tl.load(b_ptr + idx, mask=mask, other=0).to(OUT_DT)
+    c = tl.load(c_ptr + idx, mask=mask, other=0).to(OUT_DT)
+    tl.store(out_ptr + idx, fn(a, b, c, s.to(OUT_DT)).to(OUT_DT), mask=mask)
+
+
 # ---------------------------------------------------------------------------
 # launch accounting (used by the launch-count regression test)
 # ---------------------------------------------------------------------------
@@ -489,3 +610,384 @@ def foreach_unary(
         _STATS.writebacks += 1
 
     return results  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# multi-input entry points
+# ---------------------------------------------------------------------------
+
+
+def _dense(t: torch.Tensor) -> torch.Tensor:
+    """A flat-addressable view of ``t``, copying only when necessary.
+
+    Unlike the unary path, a merely *dense* tensor is not enough for the paired
+    kernels: two tensors that are each dense but carry different strides would
+    be matched up element-by-element in the wrong order under flat indexing.
+    ``contiguous()`` is therefore the condition here, not
+    ``is_non_overlapping_and_dense``.
+    """
+    if t.is_contiguous():
+        return t
+    _STATS.staged_inputs += 1
+    return t.contiguous()
+
+
+def _check_same_length(a: Sequence[torch.Tensor], b: Sequence[Any], what: str) -> None:
+    if len(a) != len(b):
+        raise RuntimeError(
+            f"Tensor list must have same number of elements as {what}, "
+            f"got {len(a)} and {len(b)}"
+        )
+
+
+def _result_dtype(t: torch.Tensor, other: Any) -> torch.dtype:
+    """ATen's type promotion for one tensor against a tensor or a number.
+
+    Delegating to ``torch.result_type`` rather than reimplementing the lattice
+    is deliberate: it is the same routine ATen consults, so an int64 list plus a
+    float scalar promotes to float32 here exactly as ``torch._foreach_add``
+    does.
+    """
+    return torch.result_type(t, other)
+
+
+def _resolve_scalars(tensors: Sequence[torch.Tensor], scalars: Any) -> List[Any]:
+    """Normalise the ``.Scalar`` / ``.ScalarList`` / ``.Tensor`` forms into a list.
+
+    The ``.Tensor`` overloads of ``addcmul``/``addcdiv`` take the values as a
+    one-dimensional tensor holding one entry per tensor in the list (ATen
+    requires it on the CPU), so it is unpacked here rather than being mistaken
+    for a single value.
+    """
+    if isinstance(scalars, torch.Tensor):
+        if scalars.numel() == 1:
+            return [scalars.item()] * len(tensors)
+        _check_same_length(tensors, scalars, "scalar list")
+        return scalars.detach().cpu().tolist()
+    if isinstance(scalars, (list, tuple)):
+        _check_same_length(tensors, scalars, "scalar list")
+        return list(scalars)
+    return [scalars] * len(tensors)
+
+
+def _finish_inplace(
+    results: List[torch.Tensor],
+    writebacks: List[Tuple[torch.Tensor, torch.Tensor]],
+) -> None:
+    for dst_view, staged in writebacks:
+        dst_view.copy_(staged)
+        _STATS.writebacks += 1
+    del results
+
+
+def foreach_binary_list(
+    self: Sequence[torch.Tensor],
+    other: Sequence[torch.Tensor],
+    fn: Callable,
+    *,
+    inplace: bool = False,
+    allowed_dtypes: Optional[frozenset] = None,
+    out_dtype_fn: Optional[Callable[[torch.dtype], torch.dtype]] = None,
+) -> List[torch.Tensor]:
+    """``self[i] <op> other[i]`` for every position, one launch per group.
+
+    Both lists are paired position by position, so they must have equal length;
+    ATen raises rather than broadcasting across the list.
+    """
+    self = check_tensor_list(self)
+    other = check_tensor_list(other)
+    _check_same_length(self, other, "tensor list")
+    _STATS.reset()
+
+    results: List[torch.Tensor] = []
+    buckets: Dict[Tuple[Any, torch.dtype, torch.dtype], Tuple[List, List, List]] = {}
+    writebacks: List[Tuple[torch.Tensor, torch.Tensor]] = []
+
+    for a, b in zip(self, other):
+        check_dtype_supported(a.dtype, allowed_dtypes)
+        out_dtype = _result_dtype(a, b)
+        if out_dtype_fn is not None:
+            out_dtype = out_dtype_fn(out_dtype)
+        src_a = _dense(a)
+        src_b = _dense(b)
+        if inplace:
+            if out_dtype != a.dtype:
+                raise RuntimeError(
+                    f"result type {str(out_dtype).replace('torch.', '').capitalize()}"
+                    " can't be cast to the desired output type "
+                    f"{str(a.dtype).replace('torch.', '').capitalize()}"
+                )
+            if has_internal_overlap(a):
+                raise RuntimeError(
+                    "unsupported operation: more than one element of the "
+                    "written-to tensor refers to a single memory location. "
+                    "Please clone() the tensor before performing the operation."
+                )
+            dst = src_a
+            if dst is not a:
+                writebacks.append((a, dst))
+            results.append(a)
+        else:
+            dst = torch.empty_like(src_a, dtype=out_dtype)
+            results.append(dst)
+        key = (a.device, src_a.dtype, src_b.dtype)
+        bucket = buckets.get(key)
+        if bucket is None:
+            bucket = buckets[key] = ([], [], [])
+        bucket[0].append(src_a)
+        bucket[1].append(src_b)
+        bucket[2].append(dst)
+
+    for (device, a_dt, b_dt), (a_list, b_list, d_list) in buckets.items():
+        _launch_binary_group(a_list, b_list, d_list, fn, a_dt, b_dt, device)
+
+    _finish_inplace(results, writebacks)
+    return results
+
+
+def _launch_binary_group(
+    a_list: List[torch.Tensor],
+    b_list: List[torch.Tensor],
+    d_list: List[torch.Tensor],
+    fn: Callable,
+    a_dt: torch.dtype,
+    b_dt: torch.dtype,
+    device: Any,
+) -> None:
+    numels = [t.numel() for t in a_list]
+    max_numel = max(numels)
+    if max_numel == 0:
+        return
+    block = _pick_block(numels)
+    nt = len(a_list)
+    meta = torch.tensor(
+        [t.data_ptr() for t in a_list]
+        + [t.data_ptr() for t in b_list]
+        + [t.data_ptr() for t in d_list]
+        + numels,
+        dtype=torch.int64,
+    ).to(device, non_blocking=True)
+    grid = (nt, triton.cdiv(max_numel, block))
+    foreach_binary_kernel[grid](
+        meta, fn, nt, tl_dtype(a_dt), tl_dtype(b_dt), tl_dtype(d_list[0].dtype), block
+    )
+    _STATS.executor_launches += 1
+    _STATS.groups += 1
+
+
+def foreach_binary_scalar(
+    self: Sequence[torch.Tensor],
+    scalars: Any,
+    fn: Callable,
+    *,
+    inplace: bool = False,
+    allowed_dtypes: Optional[frozenset] = None,
+    out_dtype_fn: Optional[Callable[[torch.dtype], torch.dtype]] = None,
+) -> List[torch.Tensor]:
+    """``self[i] <op> scalar`` -- serves the ``.Scalar`` and ``.ScalarList`` forms.
+
+    ``scalars`` is either one number (broadcast to every tensor) or a sequence
+    of one number per tensor.
+    """
+    self = check_tensor_list(self)
+    values = _resolve_scalars(self, scalars)
+    _STATS.reset()
+
+    results: List[torch.Tensor] = []
+    buckets: Dict[Tuple[Any, torch.dtype, torch.dtype], Tuple[List, List, List]] = {}
+    writebacks: List[Tuple[torch.Tensor, torch.Tensor]] = []
+
+    for t, v in zip(self, values):
+        check_dtype_supported(t.dtype, allowed_dtypes)
+        out_dtype = _result_dtype(t, v)
+        if out_dtype_fn is not None:
+            out_dtype = out_dtype_fn(out_dtype)
+        src = _dense(t)
+        if inplace:
+            if out_dtype != t.dtype:
+                raise RuntimeError(
+                    f"result type {str(out_dtype).replace('torch.', '').capitalize()}"
+                    " can't be cast to the desired output type "
+                    f"{str(t.dtype).replace('torch.', '').capitalize()}"
+                )
+            if has_internal_overlap(t):
+                raise RuntimeError(
+                    "unsupported operation: more than one element of the "
+                    "written-to tensor refers to a single memory location. "
+                    "Please clone() the tensor before performing the operation."
+                )
+            dst = src
+            if dst is not t:
+                writebacks.append((t, dst))
+            results.append(t)
+        else:
+            dst = torch.empty_like(src, dtype=out_dtype)
+            results.append(dst)
+        key = (t.device, src.dtype, out_dtype)
+        bucket = buckets.get(key)
+        if bucket is None:
+            bucket = buckets[key] = ([], [], [])
+        bucket[0].append(src)
+        bucket[1].append(dst)
+        bucket[2].append(v)
+
+    for (device, in_dt, out_dt), (srcs, dsts, vals) in buckets.items():
+        _launch_scalar_group(srcs, dsts, vals, fn, in_dt, out_dt, device)
+
+    _finish_inplace(results, writebacks)
+    return results
+
+
+def _launch_scalar_group(
+    srcs: List[torch.Tensor],
+    dsts: List[torch.Tensor],
+    vals: List[Any],
+    fn: Callable,
+    in_dt: torch.dtype,
+    out_dt: torch.dtype,
+    device: Any,
+) -> None:
+    numels = [t.numel() for t in srcs]
+    max_numel = max(numels)
+    if max_numel == 0:
+        return
+    block = _pick_block(numels)
+    nt = len(srcs)
+    meta = torch.tensor(
+        [t.data_ptr() for t in srcs] + [t.data_ptr() for t in dsts] + numels,
+        dtype=torch.int64,
+    ).to(device, non_blocking=True)
+    # The scalars ride in a device array of the *output* dtype, so integer
+    # operators keep integer semantics instead of going through a float.
+    s_dtype = out_dt if out_dt.is_floating_point else torch.float64
+    scalar_buf = torch.tensor([float(v) for v in vals], dtype=torch.float64).to(
+        device, non_blocking=True
+    )
+    if s_dtype is not torch.float64:
+        scalar_buf = scalar_buf.to(s_dtype)
+    grid = (nt, triton.cdiv(max_numel, block))
+    foreach_binary_scalar_kernel[grid](
+        meta,
+        scalar_buf,
+        fn,
+        nt,
+        tl_dtype(in_dt),
+        tl_dtype(out_dt),
+        tl_dtype(scalar_buf.dtype),
+        block,
+    )
+    _STATS.executor_launches += 1
+    _STATS.groups += 1
+
+
+def foreach_ternary(
+    self: Sequence[torch.Tensor],
+    tensor1: Sequence[torch.Tensor],
+    tensor2: Sequence[torch.Tensor],
+    scalars: Any,
+    fn: Callable,
+    *,
+    inplace: bool = False,
+    allowed_dtypes: Optional[frozenset] = None,
+) -> List[torch.Tensor]:
+    """``fn(self[i], tensor1[i], tensor2[i], scalar[i])`` for every position.
+
+    Serves ``addcmul`` / ``addcdiv``, whose value argument is either one number
+    or one per tensor.
+    """
+    self = check_tensor_list(self)
+    tensor1 = check_tensor_list(tensor1)
+    tensor2 = check_tensor_list(tensor2)
+    _check_same_length(self, tensor1, "tensor list")
+    _check_same_length(self, tensor2, "tensor list")
+    values = _resolve_scalars(self, scalars)
+    _STATS.reset()
+
+    results: List[torch.Tensor] = []
+    buckets: Dict[Tuple[Any, torch.dtype, torch.dtype], Tuple[List, ...]] = {}
+    writebacks: List[Tuple[torch.Tensor, torch.Tensor]] = []
+
+    for a, b, c, v in zip(self, tensor1, tensor2, values):
+        check_dtype_supported(a.dtype, allowed_dtypes)
+        # ``result_type`` pairs two tensors or a tensor and a number, so the
+        # three-way promotion is folded through zero-element probes of the
+        # intermediate dtype rather than by chaining dtypes directly.
+        out_dtype = torch.result_type(a, b)
+        out_dtype = torch.result_type(
+            torch.empty(0, dtype=out_dtype, device="meta"), c.to("meta")
+        )
+        if not out_dtype.is_floating_point and not out_dtype.is_complex:
+            out_dtype = torch.result_type(a, v)
+        src_a, src_b, src_c = _dense(a), _dense(b), _dense(c)
+        if inplace:
+            if out_dtype != a.dtype:
+                raise RuntimeError(
+                    f"result type {str(out_dtype).replace('torch.', '').capitalize()}"
+                    " can't be cast to the desired output type "
+                    f"{str(a.dtype).replace('torch.', '').capitalize()}"
+                )
+            if has_internal_overlap(a):
+                raise RuntimeError(
+                    "unsupported operation: more than one element of the "
+                    "written-to tensor refers to a single memory location. "
+                    "Please clone() the tensor before performing the operation."
+                )
+            dst = src_a
+            if dst is not a:
+                writebacks.append((a, dst))
+            results.append(a)
+        else:
+            dst = torch.empty_like(src_a, dtype=out_dtype)
+            results.append(dst)
+        key = (a.device, src_a.dtype, out_dtype)
+        bucket = buckets.get(key)
+        if bucket is None:
+            bucket = buckets[key] = ([], [], [], [], [])
+        bucket[0].append(src_a)
+        bucket[1].append(src_b)
+        bucket[2].append(src_c)
+        bucket[3].append(dst)
+        bucket[4].append(v)
+
+    for (device, in_dt, out_dt), (a_l, b_l, c_l, d_l, v_l) in buckets.items():
+        _launch_ternary_group(a_l, b_l, c_l, d_l, v_l, fn, in_dt, out_dt, device)
+
+    _finish_inplace(results, writebacks)
+    return results
+
+
+def _launch_ternary_group(
+    a_l: List[torch.Tensor],
+    b_l: List[torch.Tensor],
+    c_l: List[torch.Tensor],
+    d_l: List[torch.Tensor],
+    v_l: List[Any],
+    fn: Callable,
+    in_dt: torch.dtype,
+    out_dt: torch.dtype,
+    device: Any,
+) -> None:
+    numels = [t.numel() for t in a_l]
+    max_numel = max(numels)
+    if max_numel == 0:
+        return
+    block = _pick_block(numels)
+    nt = len(a_l)
+    meta = torch.tensor(
+        [t.data_ptr() for t in a_l]
+        + [t.data_ptr() for t in b_l]
+        + [t.data_ptr() for t in c_l]
+        + [t.data_ptr() for t in d_l]
+        + numels,
+        dtype=torch.int64,
+    ).to(device, non_blocking=True)
+    s_dtype = out_dt if out_dt.is_floating_point else torch.float32
+    scalar_buf = torch.tensor([float(v) for v in v_l], dtype=s_dtype).to(
+        device, non_blocking=True
+    )
+    grid = (nt, triton.cdiv(max_numel, block))
+    foreach_ternary_kernel[grid](
+        meta, scalar_buf, fn, nt, tl_dtype(in_dt), tl_dtype(out_dt), block
+    )
+    _STATS.executor_launches += 1
+    _STATS.groups += 1

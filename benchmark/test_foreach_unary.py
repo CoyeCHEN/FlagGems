@@ -100,7 +100,7 @@ def _params(inplace: bool):
     """One `pytest.param` per operator, carrying that operator's own marker.
 
     `parametrize` alone generates the cases but attaches no marker, so
-    `pytest -m underscore_foreach_abs` selects nothing and
+    `pytest -m foreach_abs` selects nothing and
     `benchmark/conftest.py` falls back to the node id when it derives the
     operator id for the recorded result. Attaching the marker per parameter is
     what makes each generated case addressable as its own operator; the marker
@@ -109,9 +109,7 @@ def _params(inplace: bool):
     """
     suffix = "_" if inplace else ""
     return [
-        pytest.param(
-            name, marks=getattr(pytest.mark, f"underscore_foreach_{name}{suffix}")
-        )
+        pytest.param(name, marks=getattr(pytest.mark, f"foreach_{name}{suffix}"))
         for name in BENCH_OPS
     ]
 
@@ -142,8 +140,8 @@ def test_perf_foreach_unary_(name):
 @pytest.mark.parametrize(
     "name",
     [
-        pytest.param("abs", marks=pytest.mark.underscore_foreach_abs),
-        pytest.param("sin", marks=pytest.mark.underscore_foreach_sin),
+        pytest.param("abs", marks=pytest.mark.foreach_abs),
+        pytest.param("sin", marks=pytest.mark.foreach_sin),
     ],
 )
 def test_perf_foreach_unary_list_length(name):

@@ -340,6 +340,13 @@ median_dim:
 # operator instead would mean sixty identical blocks, and any omission would
 # fall through to the shared `Benchmark` default of 1024**3 elements, which at
 # sixteen tensors per call reserves 64 GiB per dtype.
+ForeachOpsBenchmark:
+  shapes:
+    - [256, 256]
+    - [512, 512]
+    - [1024, 1024]
+  shape_desc: "M, N (per tensor, list of 16)"
+
 ForeachUnaryBenchmark:
   shapes:
     - [256, 256]
