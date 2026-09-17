@@ -49,6 +49,7 @@ from flag_gems.ops._conj_copy import _conj_copy, _conj_copy_out
 from flag_gems.ops._convert_weight_to_int4pack import _convert_weight_to_int4pack
 from flag_gems.ops._convolution_double_backward import _convolution_double_backward
 from flag_gems.ops._convolution_mode import _convolution_mode
+from flag_gems.ops._cslt_sparse_mm import _cslt_sparse_mm
 from flag_gems.ops._cummax_helper import _cummax_helper
 from flag_gems.ops._cummin_helper import _cummin_helper
 from flag_gems.ops._dirichlet_grad import _dirichlet_grad
@@ -323,6 +324,10 @@ from flag_gems.ops._upsample_bilinear2d_aa import _upsample_bilinear2d_aa
 from flag_gems.ops._upsample_bilinear2d_aa_backward import (
     _upsample_bilinear2d_aa_backward,
 )
+from flag_gems.ops._upsample_lanczos2d_aa_backward import (
+    upsample_lanczos2d_aa_backward,
+    upsample_lanczos2d_aa_backward_grad_input,
+)
 from flag_gems.ops._upsample_nearest_exact1d import _upsample_nearest_exact1d
 from flag_gems.ops._upsample_nearest_exact1d_backward import (
     _upsample_nearest_exact1d_backward,
@@ -343,6 +348,10 @@ from flag_gems.ops._weight_int4pack_mm_with_scales_and_zeros import (
 from flag_gems.ops._weight_norm import _weight_norm
 from flag_gems.ops._weight_norm_differentiable_backward import (
     weight_norm_differentiable_backward,
+)
+from flag_gems.ops._wrapped_linear_prepack import _wrapped_linear_prepack
+from flag_gems.ops._wrapped_quantized_linear_prepacked import (
+    _wrapped_quantized_linear_prepacked,
 )
 from flag_gems.ops.abs import abs, abs_
 from flag_gems.ops.absolute import absolute, absolute_
@@ -590,6 +599,7 @@ from flag_gems.ops.fake_quantize_per_tensor_affine_cachemask import (
 from flag_gems.ops.fake_quantize_per_tensor_affine_cachemask_backward import (
     fake_quantize_per_tensor_affine_cachemask_backward,
 )
+from flag_gems.ops.feature_alpha_dropout import feature_alpha_dropout
 from flag_gems.ops.feature_dropout import feature_dropout, feature_dropout_
 from flag_gems.ops.fft import fft
 from flag_gems.ops.fft_irfftn import fft_irfftn
@@ -782,6 +792,7 @@ from flag_gems.ops.linalg_matrix_sqrth import (
 )
 from flag_gems.ops.linalg_multi_dot import linalg_multi_dot, linalg_multi_dot_out
 from flag_gems.ops.linalg_norm import linalg_norm
+from flag_gems.ops.linalg_polar import linalg_polar, linalg_polar_out
 from flag_gems.ops.linalg_qr import linalg_qr, linalg_qr_out
 from flag_gems.ops.linalg_slogdet import linalg_slogdet
 from flag_gems.ops.linalg_solve import linalg_solve
@@ -1202,6 +1213,10 @@ from flag_gems.ops.tan import tan, tan_
 from flag_gems.ops.tanh import tanh, tanh_, tanh_backward
 from flag_gems.ops.te_rmsnorm import te_rmsnorm_bwd, te_rmsnorm_fwd
 from flag_gems.ops.tensor_split import tensor_split
+from flag_gems.ops.thnn_fused_gru_cell_backward import (
+    _thnn_fused_gru_cell_backward,
+    _thnn_fused_gru_cell_backward_out,
+)
 from flag_gems.ops.threshold import threshold, threshold_backward
 from flag_gems.ops.threshold_ import threshold_
 from flag_gems.ops.tile import tile
@@ -1319,6 +1334,7 @@ __all__ = [
     "_convert_weight_to_int4pack",
     "_convolution_double_backward",
     "_convolution_mode",
+    "_cslt_sparse_mm",
     "_cummax_helper",
     "_cummin_helper",
     "_dirichlet_grad",
@@ -1532,6 +1548,8 @@ __all__ = [
     "_sparse_semi_structured_mm",
     "_thnn_differentiable_gru_cell_backward",
     "_thnn_fused_gru_cell",
+    "_thnn_fused_gru_cell_backward",
+    "_thnn_fused_gru_cell_backward_out",
     "_thnn_fused_gru_cell_out",
     "_thnn_fused_lstm_cell",
     "_thnn_fused_lstm_cell_backward",
@@ -1557,6 +1575,8 @@ __all__ = [
     "_upsample_nearest_exact3d_backward_grad_input",
     "_weight_int4pack_mm_with_scales_and_zeros",
     "_weight_norm",
+    "_wrapped_linear_prepack",
+    "_wrapped_quantized_linear_prepacked",
     "abs",
     "abs_",
     "absolute",
@@ -1843,6 +1863,7 @@ __all__ = [
     "fake_quantize_per_tensor_affine_cachemask",
     "fake_quantize_per_tensor_affine_cachemask_backward",
     "fake_quantize_per_tensor_affine_cachemask_out",
+    "feature_alpha_dropout",
     "feature_dropout",
     "feature_dropout_",
     "fft",
@@ -2070,6 +2091,8 @@ __all__ = [
     "linalg_multi_dot",
     "linalg_multi_dot_out",
     "linalg_norm",
+    "linalg_polar",
+    "linalg_polar_out",
     "linalg_qr",
     "linalg_qr_out",
     "linalg_slogdet",
@@ -2572,6 +2595,8 @@ __all__ = [
     "unsqueeze_",
     "upsample_bicubic2d",
     "upsample_bilinear2d",
+    "upsample_lanczos2d_aa_backward",
+    "upsample_lanczos2d_aa_backward_grad_input",
     "upsample_linear1d",
     "upsample_linear1d_backward",
     "upsample_nearest1d",
