@@ -6808,18 +6808,6 @@ ops:
   - PointWise
   stages:
   - alpha: '5.4'
-- id: foreach_powsum_scalar
-  description: per-tensor sum of powered magnitudes for each tensor in a list, against
-    a single scalar.
-  for:
-  - _foreach_powsum.Scalar
-  labels:
-  - aten
-  - KernelGen
-  kind:
-  - Reduction
-  stages:
-  - alpha: '5.4'
 - id: foreach_reciprocal
   description: Apply reciprocal to each tensor in a list.
   for:

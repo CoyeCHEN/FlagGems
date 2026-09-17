@@ -162,7 +162,6 @@ from flag_gems.ops._foreach_binary import (
 from flag_gems.ops._foreach_reduction import (
     _foreach_max,
     _foreach_norm,
-    _foreach_powsum,
     _foreach_zero,
     _foreach_zero_,
 )
@@ -1426,7 +1425,6 @@ __all__ = [
     "_foreach_pow_Scalar",
     "_foreach_pow_ScalarAndTensor",
     "_foreach_pow_ScalarList",
-    "_foreach_powsum",
     "_foreach_reciprocal",
     "_foreach_reciprocal_",
     "_foreach_round",

@@ -1,12 +1,12 @@
 """Registration table for the reducing and constant-writing ``_foreach_*`` ops.
 
-These five operators do not fit the element-wise executor in
+These four operators do not fit the element-wise executor in
 :mod:`flag_gems.utils.foreach`, whose contract is ``fn(x) -> y`` over matching
 element positions:
 
-* ``_foreach_max`` and ``_foreach_norm`` / ``_foreach_powsum`` *reduce* -- each
-  input tensor collapses to a zero-dimensional output (measured: a ``[4]``
-  input yields a ``[]`` result).
+* ``_foreach_max`` and ``_foreach_norm`` *reduce* -- each input tensor collapses
+  to a zero-dimensional output (measured: a ``[4]`` input yields a ``[]``
+  result).
 * ``_foreach_zero`` / ``_foreach_zero_`` write a constant and never read the
   input at all.
 
@@ -46,7 +46,7 @@ def _max_kernel(
 ):
     """Per-tensor maximum over a whole TensorList, one launch for the list.
 
-    Same metadata layout as :func:`_powsum_kernel`. Looping over the list on the
+    Same metadata layout as :func:`_norm_kernel`. Looping over the list on the
     host and calling ``ops/max.py`` per tensor works and is correct, but costs a
     launch each: that version measured 2.18ms for sixty-four 512x512 tensors
     against PyTorch's 0.11ms.
@@ -105,7 +105,7 @@ def _foreach_max(self: Sequence[torch.Tensor]) -> List[torch.Tensor]:
 
 
 @triton.jit
-def _powsum_kernel(
+def _norm_kernel(
     meta_ptr,
     out_ptr,
     ORD: tl.constexpr,
@@ -116,6 +116,8 @@ def _powsum_kernel(
 
     ``meta_ptr`` holds ``NT`` input pointers followed by ``NT`` element counts,
     all int64; program ``t`` reduces tensor ``t`` and writes ``out_ptr[t]``.
+    The final root that distinguishes a norm from a bare power sum is applied
+    afterwards on the host by :func:`_finish`.
 
     Composing this from ``abs`` / ``pow`` / ``sum`` instead would cost four
     launches *per tensor*: that version measured 3.8ms for sixteen 512x512
@@ -144,7 +146,7 @@ def _powsum_kernel(
     tl.store(out_ptr + t, tl.sum(acc))
 
 
-def _powsum_list(
+def _pow_sum_list(
     tensors: List[torch.Tensor], ord_: Any, dtype: Optional[torch.dtype]
 ) -> List[torch.Tensor]:
     """One launch per ``(device, dtype)`` group, mirroring the element-wise path."""
@@ -173,7 +175,7 @@ def _powsum_list(
             meta = torch.tensor(
                 [w.data_ptr() for w in work] + numels, dtype=torch.int64
             ).to(device, non_blocking=True)
-            _powsum_kernel[(len(work),)](
+            _norm_kernel[(len(work),)](
                 meta, acc, ORD=ord_key, IN_DT=tl_dtype(in_dtype), BLOCK=1024
             )
         for slot, i in enumerate(idxs):
@@ -181,9 +183,9 @@ def _powsum_list(
     return results  # type: ignore[return-value]
 
 
-def _finish(total: torch.Tensor, ord_f: float, root: bool) -> torch.Tensor:
-    """Apply the final root for ``norm``; ``powsum`` stops at the sum."""
-    if not root or ord_f == 1.0:
+def _finish(total: torch.Tensor, ord_f: float) -> torch.Tensor:
+    """Apply the final root that turns a power sum into a norm."""
+    if ord_f == 1.0:
         return total
     return total.sqrt() if ord_f == 2.0 else total.pow(1.0 / ord_f)
 
@@ -194,17 +196,8 @@ def _foreach_norm(
     """Per-tensor vector norm of order ``ord``."""
     logger.debug("GEMS _FOREACH_NORM")
     tensors = check_tensor_list(self)
-    sums = _powsum_list(tensors, ord, dtype)
-    return [_finish(s, float(ord), root=True) for s in sums]
-
-
-def _foreach_powsum(
-    self: Sequence[torch.Tensor], ord=2, dtype=None
-) -> List[torch.Tensor]:
-    """Per-tensor ``sum(|x| ** ord)`` -- ``norm`` without the final root."""
-    logger.debug("GEMS _FOREACH_POWSUM")
-    tensors = check_tensor_list(self)
-    return _powsum_list(tensors, ord, dtype)
+    sums = _pow_sum_list(tensors, ord, dtype)
+    return [_finish(s, float(ord)) for s in sums]
 
 
 def _zero_one(t: torch.Tensor) -> None:
@@ -255,7 +248,6 @@ def registered_wrappers():
     return {
         "_foreach_max": _foreach_max,
         "_foreach_norm.Scalar": _foreach_norm,
-        "_foreach_powsum.Scalar": _foreach_powsum,
         "_foreach_zero": _foreach_zero,
         "_foreach_zero_": _foreach_zero_,
     }

@@ -131,7 +131,6 @@ foreach_pow_scalar_: test_foreach_ops
 foreach_pow_scalar_and_tensor: test_foreach_ops
 foreach_pow_scalar_list: test_foreach_ops
 foreach_pow_scalar_list_: test_foreach_ops
-foreach_powsum_scalar: test_foreach_ops
 foreach_reciprocal: test_foreach_unary
 foreach_reciprocal_: test_foreach_unary
 foreach_round: test_foreach_unary

@@ -82,7 +82,7 @@ def _build_args(core, overload, shapes, dtype, device):
         return (lists(), weight)
     if core == "copy":
         return (lists(),)
-    if core in ("max", "norm", "powsum", "zero"):
+    if core in ("max", "norm", "zero"):
         return ()
     return {
         "List": (lists(),),
@@ -220,7 +220,6 @@ PARAMS = [pytest.param(k, marks=getattr(pytest.mark, _marks_for(k))) for k in AL
 @pytest.mark.foreach_pow_scalar_and_tensor
 @pytest.mark.foreach_pow_scalar_list
 @pytest.mark.foreach_pow_scalar_list_
-@pytest.mark.foreach_powsum_scalar
 @pytest.mark.foreach_sub_list
 @pytest.mark.foreach_sub_list_
 @pytest.mark.foreach_sub_scalar
@@ -394,14 +393,14 @@ def test_foreach_ops_length_mismatch_rejected(key):
     [
         pytest.param("norm", 1, marks=pytest.mark.foreach_norm_scalar),
         pytest.param("norm", 2, marks=pytest.mark.foreach_norm_scalar),
-        pytest.param("powsum", 2, marks=pytest.mark.foreach_powsum_scalar),
     ],
 )
 def test_accuracy_foreach_reduction_orders(core, ord_):
     """The reductions collapse each tensor to a scalar, for several orders.
 
-    ``powsum`` is ``norm`` without the final root, which is why both are checked
-    against their own ATen overload rather than against each other.
+    ``ord=1`` and ``ord=2`` take different paths inside the kernel (a sum versus
+    a sum of squares), so both are checked rather than trusting one to imply the
+    other.
     """
     device = flag_gems.device
     inp = [_sample(s, torch.float32, device) for s in [(16,), (4, 5)]]
@@ -468,7 +467,7 @@ def test_accuracy_foreach_int_promotion():
     gems_assert_close(res_out[0], ref_out[0], ref_out[0].dtype)
 
 
-@pytest.mark.foreach_add__scalar
+@pytest.mark.foreach_add_scalar_
 def test_foreach_inplace_rejects_promotion():
     """An in-place op may not narrow a promoted result back into an int input."""
     inp = [torch.randint(1, 5, (8,), dtype=torch.int64, device=flag_gems.device)]

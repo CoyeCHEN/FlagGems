@@ -80,7 +80,7 @@ class ForeachOpsBenchmark(base.Benchmark):
                 yield (tensors, mk(), weight)
             elif self.core == "copy":
                 yield (tensors, mk())
-            elif self.core in ("max", "norm", "powsum", "zero"):
+            elif self.core in ("max", "norm", "zero"):
                 yield (tensors,)
             elif self.overload == "List":
                 yield (tensors, mk())

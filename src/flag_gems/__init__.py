@@ -290,7 +290,6 @@ _FULL_CONFIG = (
     ("_foreach_pow_.List", _foreach_pow__List),
     ("_foreach_pow_.Scalar", _foreach_pow__Scalar),
     ("_foreach_pow_.ScalarList", _foreach_pow__ScalarList),
-    ("_foreach_powsum.Scalar", _foreach_powsum),
     ("_foreach_reciprocal", _foreach_reciprocal),
     ("_foreach_reciprocal_", _foreach_reciprocal_),
     ("_foreach_round", _foreach_round),
