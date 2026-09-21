@@ -29,6 +29,7 @@ import triton
 import triton.language as tl
 
 from flag_gems.ops._foreach_complex_math import (
+    _hypot_fn,
     c_acos,
     c_asin,
     c_atan,
@@ -137,7 +138,7 @@ def _abs_func(x):
 def _abs_complex_func(re, im):
     # Modulus of a complex value.  The executor passes the real and imaginary
     # components separately because Triton has no complex dtype.
-    return tl.sqrt(re * re + im * im)
+    return _hypot_fn(re, im)
 
 
 # ---------------------------------------------------------------------------

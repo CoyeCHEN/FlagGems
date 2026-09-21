@@ -482,3 +482,241 @@ def test_foreach_ops_dtype_sets_match_aten(core):
     assert allowed is not None
     for dtype in (torch.float32, torch.int32):
         assert dtype in allowed, f"{core} should accept {dtype}"
+
+
+# ---------------------------------------------------------------------------
+# parity cases for the dtype and order corners
+# ---------------------------------------------------------------------------
+#
+# These call the registered FlagGems API by name rather than reaching into
+# ``flag_gems.ops``: the public entry point is what the dispatcher would reach,
+# so a bug in the registration cannot hide behind a direct call. ``to_reference``
+# moves the operands to the reference device, which is what makes the same
+# assertions valid under ``--ref=cpu``.
+
+
+def _gems(key):
+    """The public FlagGems function an ATen key is registered to.
+
+    Public names spell the overload with an underscore suffix rather than
+    ATen's dot (``_foreach_add_List``, not ``_foreach_add.List``), so the key is
+    rewritten rather than looked up verbatim.
+    """
+    return BINARY_WRAPPERS[key] if key in BINARY_WRAPPERS else REDUCTION_WRAPPERS[key]
+
+
+@pytest.mark.parametrize("core", ["add", "sub", "mul"])
+@pytest.mark.parametrize(
+    "left",
+    [
+        pytest.param([True, True, False], id="tt_f"),
+        pytest.param([False, False, True], id="ff_t"),
+    ],
+)
+def test_accuracy_foreach_bool(core, left):
+    """bool arithmetic matches ATen per operator, including its refusals.
+
+    ATen defines bool ``add`` as logical or and bool ``mul`` as logical and, but
+    rejects bool ``sub`` outright. Sharing one dtype set across the family would
+    both accept the refused case and get ``True + True`` wrong.
+    """
+    device = flag_gems.device
+    other = [True, False, False]
+    inp = [torch.tensor(left, dtype=torch.bool, device=device)]
+    ref_inp = [to_reference(t) for t in inp]
+
+    if core == "sub":
+        with pytest.raises(RuntimeError):
+            _gems("_foreach_sub.List")(inp, [torch.tensor(other, device=device)])
+        with pytest.raises(RuntimeError):
+            torch._foreach_sub(ref_inp, [torch.tensor(other, device=ref_inp[0].device)])
+        return
+
+    # ``add``/``mul`` accept bool here; ``sub`` is the only refusal in this set.
+    res = _gems(f"_foreach_{core}.List")(inp, [torch.tensor(other, device=device)])
+    ref_operand = torch.tensor(other, device=ref_inp[0].device)
+    ref = getattr(torch, f"_foreach_{core}")(ref_inp, [ref_operand])
+    gems_assert_close(res[0], ref[0], torch.bool)
+
+
+@pytest.mark.parametrize("alpha", [1, 2, 2.5, -1.0])
+def test_accuracy_foreach_add_alpha(alpha):
+    """``alpha`` scales the second operand, applied inside the kernel.
+
+    The scaling must not go through a host-side temporary, which would add a
+    second dispatch per call.
+    """
+    device = flag_gems.device
+    inp = [_sample((16,), torch.float32, device)]
+    other = [_sample((16,), torch.float32, device)]
+    ref_inp = [to_reference(t) for t in inp]
+    ref_other = [to_reference(t) for t in other]
+
+    res = _gems("_foreach_add.List")(inp, other, alpha=alpha)
+    ref = torch._foreach_add(ref_inp, ref_other, alpha=alpha)
+    gems_assert_close(res[0], ref[0], torch.float32)
+
+
+def test_foreach_alpha_keeps_one_launch():
+    """``alpha`` is not paid for with an extra executor launch."""
+    if flag_gems.device != "cuda":
+        return
+    from flag_gems.utils.foreach import launch_stats
+
+    inp = [_sample((512,), torch.float32, flag_gems.device) for _ in range(16)]
+    other = [t.clone() for t in inp]
+    _gems("_foreach_add.List")(inp, other, alpha=2.5)
+    assert launch_stats()["executor_launches"] == 1
+
+
+@pytest.mark.parametrize("inplace", [False, True])
+@pytest.mark.parametrize(
+    "src_dtype",
+    [torch.float32, torch.float16, torch.int64, torch.bool],
+)
+def test_accuracy_foreach_copy_mixed_dtype(inplace, src_dtype):
+    """``copy`` keeps the destination dtype and casts the source into it.
+
+    This is assignment semantics, not type promotion: an fp16 destination stays
+    fp16 when the source is fp32, and the in-place form accepts the narrowing
+    that the generic promotion check would reject.
+    """
+    device = flag_gems.device
+
+    # ``rand`` has no integral or bool kernel, so those sources are built from
+    # an integer randint and cast, keeping the values exactly representable in
+    # fp16 so the cast back is lossless in the compared region.
+    def _make_source(dtype):
+        if dtype.is_floating_point:
+            return torch.rand((16,), dtype=dtype, device=device)
+        return torch.randint(0, 2, (16,), device=device).to(dtype)
+
+    if inplace:
+        inp = [torch.ones((16,), dtype=torch.float16, device=device)]
+        src = [_make_source(src_dtype)]
+        ref_dst = [to_reference(t) for t in inp]
+        ref_src = [to_reference(t) for t in src]
+        torch._foreach_copy_(ref_dst, ref_src)
+        assert _gems("_foreach_copy_")(inp, src) is None
+        assert inp[0].dtype == ref_dst[0].dtype
+        assert torch.equal(inp[0].cpu(), ref_dst[0].cpu())
+    else:
+        inp = [torch.ones((16,), dtype=torch.float16, device=device)]
+        src = [_make_source(src_dtype)]
+        ref = torch.ops.aten._foreach_copy(
+            [to_reference(t) for t in inp], [to_reference(t) for t in src]
+        )
+        res = _gems("_foreach_copy")(inp, src)
+        assert res[0].dtype == ref[0].dtype == torch.float16
+        assert torch.equal(res[0].cpu(), ref[0].cpu())
+
+
+@pytest.mark.parametrize("device_dtype", [torch.float64, torch.int64])
+def test_accuracy_foreach_max_large_values(device_dtype):
+    """``max`` keeps the input dtype and does not round through fp32.
+
+    Values beyond the exact fp32 range expose both failures at once: an fp32
+    accumulator overflows an fp64 input, and a value above ``2**53`` loses its
+    low bits on the way out.
+    """
+    device = flag_gems.device
+    if device_dtype == torch.float64:
+        values = [1e300, -1e300, 1e299]
+        in_dtype = torch.float64
+    else:
+        values = [2**62, 3, -5]
+        in_dtype = torch.int64
+    inp = [torch.tensor(values, dtype=in_dtype, device=device)]
+
+    res = _gems("_foreach_max")(inp)
+    ref = torch._foreach_max([to_reference(inp[0])])
+
+    assert res[0].dtype == ref[0].dtype, f"{res[0].dtype} != {ref[0].dtype}"
+    assert res[0].item() == ref[0].item()
+
+
+@pytest.mark.parametrize(
+    "ord_",
+    [
+        pytest.param(0, id="count_nonzero"),
+        pytest.param(float("inf"), id="max_abs"),
+        pytest.param(float("-inf"), id="min_abs"),
+        pytest.param(1, id="sum_abs"),
+        pytest.param(2, id="l2"),
+        pytest.param(3, id="l3"),
+        pytest.param(0.5, id="half"),
+        pytest.param(-2, id="negative"),
+    ],
+)
+def test_accuracy_foreach_norm_orders(ord_):
+    """Every norm order matches ATen, including the special forms.
+
+    ``ord=0`` counts nonzero elements and ``ord=±inf`` are the extrema of
+    ``|x|``; routing those through the power sum raises ``ZeroDivisionError``
+    for ``0`` and silently wrong values for ``inf``.
+    """
+    device = flag_gems.device
+    inp = [torch.tensor([0.0, 2.0, -3.0, 0.5], device=device)]
+    ref = torch._foreach_norm([to_reference(t) for t in inp], ord_)
+
+    res = _gems("_foreach_norm.Scalar")(inp, ord_)
+    assert res[0].dtype == ref[0].dtype
+    gems_assert_close(res[0], ref[0], ref[0].dtype)
+
+
+def test_accuracy_foreach_norm_all_zero():
+    """An all-zero tensor has norm 0 for every order, including the specials."""
+    device = flag_gems.device
+    inp = [torch.zeros(8, device=device)]
+    for ord_ in (0, 1, 2, 3, float("inf"), float("-inf")):
+        res = _gems("_foreach_norm.Scalar")(inp, ord_)
+        ref = torch._foreach_norm([to_reference(t) for t in inp], ord_)
+        assert res[0].item() == ref[0].item(), f"ord={ord_}"
+
+
+@pytest.mark.foreach_pow_scalar
+@pytest.mark.foreach_pow_scalar_list
+@pytest.mark.parametrize("exponent", [True, False, 0, 2, 2.0, 0.5, -1.0, float("inf")])
+def test_accuracy_foreach_pow_bool_base(exponent):
+    """``pow`` of a bool base: the result dtype follows the exponent.
+
+    A bool exponent keeps bool (``a ** True`` is ``a``, ``a ** False`` is
+    ``True``), an int exponent gives int64, and a float exponent gives float32.
+    The negative and infinite exponents are included because a bool base is a
+    zero-or-one value and ``False ** -1`` is ``inf``: a special-cased bool
+    branch that returned the base instead would pass the integer cases and fail
+    only here.
+    """
+    device = flag_gems.device
+    inp = [torch.tensor([True, True, False], dtype=torch.bool, device=device)]
+    ref_inp = [to_reference(t) for t in inp]
+
+    res = _gems("_foreach_pow.Scalar")(inp, exponent)
+    ref = torch._foreach_pow(ref_inp, exponent)
+
+    assert res[0].dtype == ref[0].dtype, f"{res[0].dtype} != {ref[0].dtype}"
+    assert res[0].cpu().tolist() == ref[0].cpu().tolist()
+
+
+@pytest.mark.foreach_pow_list
+def test_foreach_pow_list_rejects_bool():
+    """``pow.List`` with a bool tensor operand is refused, matching ATen."""
+    device = flag_gems.device
+    inp = [torch.tensor([True, False], dtype=torch.bool, device=device)]
+    with pytest.raises(NotImplementedError):
+        _gems("_foreach_pow.List")(inp, [torch.tensor([True, True], device=device)])
+    with pytest.raises(NotImplementedError):
+        torch._foreach_pow([t.cpu() for t in inp], [torch.tensor([True, True])])
+
+
+@pytest.mark.foreach_clamp_max_scalar
+@pytest.mark.foreach_clamp_min_scalar
+@pytest.mark.foreach_maximum_scalar
+@pytest.mark.foreach_minimum_scalar
+@pytest.mark.parametrize("core", ["clamp_max", "clamp_min", "maximum", "minimum"])
+def test_foreach_clamp_scalar_rejects_bool(core):
+    """The clamp family accepts a bool *tensor* operand but not a bool scalar."""
+    device = flag_gems.device
+    inp = [torch.tensor([True, False], dtype=torch.bool, device=device)]
+    with pytest.raises(RuntimeError):
+        _gems(f"_foreach_{core}.Scalar")(inp, True)

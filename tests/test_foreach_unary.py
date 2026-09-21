@@ -539,3 +539,62 @@ def test_foreach_unary_launch_count_with_heterogeneous_numel():
     ts = [torch.rand(n, device=flag_gems.device) + 0.1 for n in (1000, 7, 65537, 4096)]
     flag_gems._foreach_log(ts)
     assert launch_stats()["executor_launches"] == 1
+
+
+# ---------------------------------------------------------------------------
+# large-magnitude complex inputs
+# ---------------------------------------------------------------------------
+#
+# The modulus ``sqrt(re**2 + im**2)`` overflows for a large but perfectly finite
+# component, and ``abs``/``log``/``sqrt``/``rsqrt`` all derive from it. These
+# cases use magnitudes above the point where the naive formula overflows in the
+# component dtype, so they fail outright rather than degrading gracefully.
+
+# ``1e20`` squares to ``1e40``, past the fp32 maximum of ~3.4e38; ``1e200``
+# does the same in fp64. Both inputs are representable, so the reference is
+# finite and the comparison stays meaningful.
+LARGE_COMPLEX = {
+    torch.complex64: 1e20,
+    torch.complex128: 1e200,
+}
+
+# The subset whose complex kernel routes through the modulus.
+MODULUS_OPS = ["abs", "log", "log1p", "log2", "log10", "sqrt", "rsqrt"]
+
+
+@pytest.mark.foreach_unary
+@pytest.mark.parametrize("name", MODULUS_OPS)
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+def test_accuracy_foreach_unary_complex_large(name, dtype):
+    """A large finite complex input must not overflow the modulus."""
+    if not _supports(name, dtype) or UNARY_OPS[name].complex_fn is None:
+        return
+    mag = LARGE_COMPLEX[dtype]
+    base = torch.tensor([complex(mag, mag), complex(mag, -mag)], dtype=dtype)
+    inp = [base.to(flag_gems.device)]
+    ref_inp = [to_reference(t) for t in inp]
+
+    ref_out = _torch_op(name)(ref_inp)
+    res_out = _gems_op(name)(inp)
+
+    _assert_lists_close(res_out, ref_out, name)
+
+
+@pytest.mark.foreach_unary
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+def test_accuracy_foreach_abs_complex_large(dtype):
+    """``abs`` of a large finite complex value stays finite.
+
+    The modulus is the shared dependency of every complex operator here, so it
+    is asserted for its own sake as well as through the operators above.
+    """
+    mag = LARGE_COMPLEX[dtype]
+    base = torch.tensor([complex(mag, mag)], dtype=dtype)
+    inp = [base.to(flag_gems.device)]
+    ref_inp = [to_reference(t) for t in inp]
+
+    ref_out = torch._foreach_abs(ref_inp)
+    res_out = _gems_op("abs")(inp)
+
+    assert torch.isfinite(res_out[0]).all(), f"{res_out[0].item()} overflowed"
+    _assert_lists_close(res_out, ref_out, "abs")

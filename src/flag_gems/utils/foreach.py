@@ -300,6 +300,7 @@ def foreach_binary_kernel(
     A_DT: tl.constexpr,
     B_DT: tl.constexpr,
     OUT_DT: tl.constexpr,
+    ALPHA: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """One launch, ``NT`` tensors, two tensor inputs per element.
@@ -319,6 +320,9 @@ def foreach_binary_kernel(
     but pairing two differently-strided tensors by flat index would silently
     match up the wrong elements, so both sides are staged to dense form by the
     caller before they reach here.
+
+    ``ALPHA`` scales the second operand before the element-wise function runs;
+    it is a ``constexpr`` so the multiply compiles away for the default value.
     """
     t = tl.program_id(0)
     offset = tl.program_id(1) * BLOCK
@@ -332,7 +336,8 @@ def foreach_binary_kernel(
     mask = idx < n_elements
     a = tl.load(a_ptr + idx, mask=mask, other=0)
     b = tl.load(b_ptr + idx, mask=mask, other=0)
-    tl.store(out_ptr + idx, fn(a.to(OUT_DT), b.to(OUT_DT)).to(OUT_DT), mask=mask)
+    b = (b * ALPHA).to(OUT_DT) if ALPHA != 1 else b.to(OUT_DT)
+    tl.store(out_ptr + idx, fn(a.to(OUT_DT), b).to(OUT_DT), mask=mask)
 
 
 @triton.jit
@@ -344,6 +349,7 @@ def foreach_binary_scalar_kernel(
     A_DT: tl.constexpr,
     OUT_DT: tl.constexpr,
     S_DT: tl.constexpr,
+    ALPHA: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """``NT`` tensors against one scalar *each*.
@@ -356,6 +362,9 @@ def foreach_binary_scalar_kernel(
     every slot on the host side. Passing the scalars through device memory
     rather than as kernel arguments keeps one compiled kernel for any list
     length, which is the whole point of the shared executor.
+
+    ``ALPHA`` scales the scalar before the element-wise function runs; it is a
+    ``constexpr`` so the multiply compiles away for the default value.
     """
     t = tl.program_id(0)
     offset = tl.program_id(1) * BLOCK
@@ -363,7 +372,9 @@ def foreach_binary_scalar_kernel(
     a_ptr = tl.load(meta_ptr + t).to(tl.pointer_type(A_DT))
     out_ptr = tl.load(meta_ptr + NT + t).to(tl.pointer_type(OUT_DT))
     n_elements = tl.load(meta_ptr + 2 * NT + t)
-    s = tl.load(scalar_ptr + t).to(S_DT)
+    s = tl.load(scalar_ptr + t)
+    s = (s * ALPHA).to(S_DT) if ALPHA != 1 else s
+    s = s.to(OUT_DT)
 
     idx = offset + tl.arange(0, BLOCK)
     mask = idx < n_elements
@@ -506,7 +517,12 @@ def _launch_group(
     _STATS.groups += 1
 
 
-def check_dtype_supported(dtype: torch.dtype, allowed: Optional[frozenset]) -> None:
+def check_dtype_supported(
+    dtype: torch.dtype,
+    allowed: Optional[frozenset],
+    message: Optional[str] = None,
+    error_type: type = RuntimeError,
+) -> None:
     """Reject dtypes the corresponding ATen operator also rejects.
 
     ``allowed=None`` means "no restriction".  Each operator's set was measured
@@ -514,9 +530,15 @@ def check_dtype_supported(dtype: torch.dtype, allowed: Optional[frozenset]) -> N
     not guessable: ``_foreach_floor`` rejects ``bool`` but accepts every integer
     dtype, ``_foreach_frac`` rejects all integers, and ``_foreach_sign``
     accepts ``bool`` while rejecting complex.
+
+    ``message`` overrides the generic text for operators whose ATen refusal is
+    worded differently, such as ``sub`` on bool.  ``error_type`` matches the
+    class ATen raises, which for ``pow`` on bool is ``NotImplementedError``.
     """
     if allowed is not None and dtype not in allowed:
-        raise RuntimeError(
+        if message is not None:
+            raise error_type(message)
+        raise error_type(
             f'"foreach" not implemented for \'{str(dtype).replace("torch.", "")}\''
         )
 
@@ -686,14 +708,24 @@ def foreach_binary_list(
     fn: Callable,
     *,
     inplace: bool = False,
+    alpha: float = 1,
     allowed_dtypes: Optional[frozenset] = None,
+    dtype_error: Optional[str] = None,
+    dtype_error_type: type = RuntimeError,
     out_dtype_fn: Optional[Callable[[torch.dtype], torch.dtype]] = None,
     out_dtypes: Optional[Sequence[torch.dtype]] = None,
+    copy_semantics: bool = False,
 ) -> List[torch.Tensor]:
-    """``self[i] <op> other[i]`` for every position, one launch per group.
+    """``self[i] <op> alpha * other[i]`` for every position, one launch per group.
 
     Both lists are paired position by position, so they must have equal length;
     ATen raises rather than broadcasting across the list.
+
+    ``alpha`` scales the second operand inside the kernel.
+
+    ``copy_semantics`` replaces type promotion with assignment semantics:
+    ``_foreach_copy`` keeps the destination dtype and simply casts the source
+    into it, in both the functional and the in-place form.
 
     ``out_dtypes`` lets the caller pin the result dtype per position. The
     ``.Tensor`` overloads need it: their operand is a scalar tensor expanded to
@@ -713,8 +745,12 @@ def foreach_binary_list(
     writebacks: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
     for i, (a, b) in enumerate(zip(self, other)):
-        check_dtype_supported(a.dtype, allowed_dtypes)
-        if out_dtypes is not None:
+        check_dtype_supported(a.dtype, allowed_dtypes, dtype_error, dtype_error_type)
+        if copy_semantics:
+            # The destination dtype is the source of truth; the operand is cast
+            # into it rather than promoted against it.
+            out_dtype = a.dtype
+        elif out_dtypes is not None:
             out_dtype = out_dtypes[i]
         else:
             out_dtype = _result_dtype(a, b)
@@ -723,7 +759,7 @@ def foreach_binary_list(
         src_a = _dense(a)
         src_b = _dense(b)
         if inplace:
-            if out_dtype != a.dtype:
+            if not copy_semantics and out_dtype != a.dtype:
                 raise RuntimeError(
                     f"result type {str(out_dtype).replace('torch.', '').capitalize()}"
                     " can't be cast to the desired output type "
@@ -751,7 +787,7 @@ def foreach_binary_list(
         bucket[2].append(dst)
 
     for (device, a_dt, b_dt), (a_list, b_list, d_list) in buckets.items():
-        _launch_binary_group(a_list, b_list, d_list, fn, a_dt, b_dt, device)
+        _launch_binary_group(a_list, b_list, d_list, fn, a_dt, b_dt, device, alpha)
 
     _finish_inplace(results, writebacks)
     return results
@@ -765,6 +801,7 @@ def _launch_binary_group(
     a_dt: torch.dtype,
     b_dt: torch.dtype,
     device: Any,
+    alpha: float = 1,
 ) -> None:
     numels = [t.numel() for t in a_list]
     max_numel = max(numels)
@@ -781,7 +818,14 @@ def _launch_binary_group(
     ).to(device, non_blocking=True)
     grid = (nt, triton.cdiv(max_numel, block))
     foreach_binary_kernel[grid](
-        meta, fn, nt, tl_dtype(a_dt), tl_dtype(b_dt), tl_dtype(d_list[0].dtype), block
+        meta,
+        fn,
+        nt,
+        tl_dtype(a_dt),
+        tl_dtype(b_dt),
+        tl_dtype(d_list[0].dtype),
+        alpha,
+        block,
     )
     _STATS.executor_launches += 1
     _STATS.groups += 1
@@ -793,13 +837,16 @@ def foreach_binary_scalar(
     fn: Callable,
     *,
     inplace: bool = False,
+    alpha: float = 1,
     allowed_dtypes: Optional[frozenset] = None,
+    dtype_error: Optional[str] = None,
+    dtype_error_type: type = RuntimeError,
     out_dtype_fn: Optional[Callable[[torch.dtype], torch.dtype]] = None,
 ) -> List[torch.Tensor]:
-    """``self[i] <op> scalar`` -- serves the ``.Scalar`` and ``.ScalarList`` forms.
+    """``self[i] <op> alpha * scalar`` -- serves the ``.Scalar`` / ``.ScalarList`` forms.
 
     ``scalars`` is either one number (broadcast to every tensor) or a sequence
-    of one number per tensor.
+    of one number per tensor.  ``alpha`` scales the scalar inside the kernel.
     """
     self = check_tensor_list(self)
     values = _resolve_scalars(self, scalars)
@@ -810,7 +857,7 @@ def foreach_binary_scalar(
     writebacks: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
     for t, v in zip(self, values):
-        check_dtype_supported(t.dtype, allowed_dtypes)
+        check_dtype_supported(t.dtype, allowed_dtypes, dtype_error, dtype_error_type)
         out_dtype = _result_dtype(t, v)
         if out_dtype_fn is not None:
             out_dtype = out_dtype_fn(out_dtype)
@@ -844,7 +891,7 @@ def foreach_binary_scalar(
         bucket[2].append(v)
 
     for (device, in_dt, out_dt), (srcs, dsts, vals) in buckets.items():
-        _launch_scalar_group(srcs, dsts, vals, fn, in_dt, out_dt, device)
+        _launch_scalar_group(srcs, dsts, vals, fn, in_dt, out_dt, device, alpha)
 
     _finish_inplace(results, writebacks)
     return results
@@ -858,6 +905,7 @@ def _launch_scalar_group(
     in_dt: torch.dtype,
     out_dt: torch.dtype,
     device: Any,
+    alpha: float = 1,
 ) -> None:
     numels = [t.numel() for t in srcs]
     max_numel = max(numels)
@@ -889,6 +937,7 @@ def _launch_scalar_group(
         tl_dtype(in_dt),
         tl_dtype(out_dt),
         tl_dtype(scalar_buf.dtype),
+        alpha,
         block,
     )
     _STATS.executor_launches += 1

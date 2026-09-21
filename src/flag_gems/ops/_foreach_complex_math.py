@@ -22,11 +22,14 @@ from flag_gems.utils import tl_extra_shim
 _sinh = tl_extra_shim.sinh
 _cosh = tl_extra_shim.cosh
 _atan2 = tl_extra_shim.atan2
+_hypot = tl_extra_shim.hypot
 
 
 @triton.jit
-def _hypot(re, im):
-    return tl.sqrt(re * re + im * im)
+def _hypot_fn(re, im):
+    # The libdevice formulation keeps the intermediate in range, so a large
+    # finite component does not overflow when squared.
+    return _hypot(re, im)
 
 
 @triton.jit
@@ -50,7 +53,7 @@ def c_expm1(re, im):
 @triton.jit
 def c_log(re, im):
     # log(z) = ln|z| + i arg(z)
-    return tl.log(_hypot(re, im)), _atan2(im, re)
+    return tl.log(_hypot_fn(re, im)), _atan2(im, re)
 
 
 @triton.jit
@@ -76,7 +79,7 @@ def c_log10(re, im):
 def c_sqrt(re, im):
     # Principal square root via the half-angle form, which avoids cancellation
     # for negative real parts.
-    m = _hypot(re, im)
+    m = _hypot_fn(re, im)
     a = tl.sqrt(0.5 * (m + re))
     b = tl.sqrt(0.5 * (m - re))
     return a, tl.where(im < 0, -b, b)

@@ -57,6 +57,12 @@ logger = logging.getLogger(__name__)
 
 @triton.jit
 def _add_fn(a, b):
+    # The paired kernel hands over the raw int1 operand, and arithmetic on int1
+    # in this Triton backend behaves like ``and`` (``True + True`` is False).
+    # ATen defines bool addition as logical or, so the operand is combined
+    # explicitly instead.
+    if a.dtype == tl.int1:
+        return a | b
     return a + b
 
 
@@ -67,6 +73,10 @@ def _sub_fn(a, b):
 
 @triton.jit
 def _mul_fn(a, b):
+    # Multiplication on int1 already coincides with logical and, but the operand
+    # is combined explicitly so the bool path does not depend on that.
+    if a.dtype == tl.int1:
+        return a & b
     return a * b
 
 
@@ -89,7 +99,10 @@ def _minimum_fn(a, b):
 def _pow_fn(a, b):
     # The shim's ``pow`` needs floating point operands; integral foreach pow is
     # promoted by the executor before the call, so the cast here only affects
-    # the intermediate and not the stored dtype.
+    # the intermediate and not the stored dtype.  A bool base takes the same
+    # path: ATen computes ``bool ** float`` in floating point (``False ** -1``
+    # is ``inf``), which the plain power already gives once the operand is
+    # promoted.
     return _pow(a.to(tl.float32), b.to(tl.float32))
 
 
@@ -139,6 +152,15 @@ ARITH = frozenset(_FLOAT + _INT + (torch.bool,))
 # round the interpolation, and ATen refuses instead.
 FLOAT_ONLY = frozenset(_FLOAT)
 
+# bool support is per *operator*, not per family, and two of the exceptions
+# depend on the overload of the second operand: ATen defines bool addition as
+# logical or but refuses ``bool - bool`` outright, and the clamp family accepts
+# a bool tensor operand yet rejects a bool scalar one.
+NO_BOOL = frozenset(_FLOAT + _INT)
+# ``pow`` has no bool kernel in the .List form but the .Scalar / .ScalarList
+# forms do accept it.  ATen reports it as NotImplementedError, not a dtype error.
+_POW_BOOL_ERROR = "\"pow\" not implemented for 'Bool'"
+
 
 def _float_result(dtype: torch.dtype) -> torch.dtype:
     """Promote an integral result to the default float type.
@@ -154,7 +176,16 @@ def _float_result(dtype: torch.dtype) -> torch.dtype:
 class BinaryOp:
     """One row of the multi-input foreach table."""
 
-    __slots__ = ("name", "fn", "allowed", "out_dtype_fn", "arity")
+    __slots__ = (
+        "name",
+        "fn",
+        "allowed",
+        "allowed_scalar",
+        "dtype_error",
+        "dtype_error_type",
+        "out_dtype_fn",
+        "arity",
+    )
 
     def __init__(
         self,
@@ -163,27 +194,59 @@ class BinaryOp:
         allowed: Optional[frozenset] = ARITH,
         out_dtype_fn: Optional[Callable] = None,
         arity: int = 2,
+        allowed_scalar: Optional[frozenset] = None,
+        dtype_error: Optional[str] = None,
+        dtype_error_type: type = RuntimeError,
     ) -> None:
         self.name = name
         self.fn = fn
         self.allowed = allowed
+        # The .Scalar / .ScalarList overloads sometimes accept a narrower set
+        # than .List; ``None`` means "same as ``allowed``".
+        self.allowed_scalar = allowed_scalar
+        # Replaces the generic dtype text when ATen words the refusal
+        # differently for this operator.
+        self.dtype_error = dtype_error
+        self.dtype_error_type = dtype_error_type
         self.out_dtype_fn = out_dtype_fn
         self.arity = arity
+
+
+# ATen's own wording for the one operator that refuses bool with a dedicated
+# message rather than the generic "not implemented" text.
+_SUB_BOOL_ERROR = (
+    "Subtraction, the `-` operator, with two bool tensors is not supported. "
+    "Use the `^` or `logical_xor()` operator instead."
+)
 
 
 BINARY_OPS: Dict[str, BinaryOp] = {
     op.name: op
     for op in (
         BinaryOp("add", _add_fn),
-        BinaryOp("sub", _sub_fn),
+        # ATen refuses ``bool - bool`` rather than defining it.
+        BinaryOp("sub", _sub_fn, NO_BOOL, dtype_error=_SUB_BOOL_ERROR),
         BinaryOp("mul", _mul_fn),
         BinaryOp("div", _div_fn, ARITH, _float_result),
-        BinaryOp("clamp_max", _minimum_fn),
-        BinaryOp("clamp_min", _maximum_fn),
-        BinaryOp("maximum", _maximum_fn),
-        BinaryOp("minimum", _minimum_fn),
-        BinaryOp("pow", _pow_fn, ARITH, _float_result),
-        BinaryOp("copy", _copy_fn),
+        BinaryOp("clamp_max", _minimum_fn, allowed_scalar=NO_BOOL),
+        BinaryOp("clamp_min", _maximum_fn, allowed_scalar=NO_BOOL),
+        BinaryOp("maximum", _maximum_fn, allowed_scalar=NO_BOOL),
+        BinaryOp("minimum", _minimum_fn, allowed_scalar=NO_BOOL),
+        # ``pow`` rejects a bool tensor operand but accepts a bool scalar; the
+        # refusal is NotImplementedError in ATen rather than a dtype error.
+        # Its result dtype is plain ``result_type(base, exponent)``, so unlike
+        # ``div`` it needs no output-dtype callback.
+        BinaryOp(
+            "pow",
+            _pow_fn,
+            NO_BOOL,
+            allowed_scalar=ARITH,
+            dtype_error=_POW_BOOL_ERROR,
+            dtype_error_type=NotImplementedError,
+        ),
+        # ``copy`` casts the operand into the destination dtype, so every dtype
+        # is accepted; no promotion happens.
+        BinaryOp("copy", _copy_fn, None),
         BinaryOp("lerp", _lerp_tensor_weight_fn, FLOAT_ONLY, None, 3),
         BinaryOp("addcmul", _addcmul_fn, ARITH, None, 4),
         BinaryOp("addcdiv", _addcdiv_fn, FLOAT_ONLY, None, 4),
@@ -196,21 +259,31 @@ def _log(name: str, overload: str, inplace: bool) -> None:
     del overload
 
 
+def _check_alpha(alpha, dtype: torch.dtype) -> None:
+    """ATen refuses a fractional ``alpha`` for integral and bool operands."""
+    if dtype in _INT + (torch.bool,) and float(alpha) != int(alpha):
+        raise RuntimeError(
+            "For integral input tensors, argument alpha must not be "
+            "a floating point number."
+        )
+
+
 def _apply_list(name: str, self, other, inplace: bool, alpha=1):
     """The ``.List`` overload: pair the two lists position by position."""
     op = BINARY_OPS[name]
     _log(name, "List", inplace)
     if alpha != 1:
-        # ``alpha`` scales the second operand before the operation.  Folding it
-        # in on the host keeps one compiled kernel per operator instead of a
-        # second variant carrying an unused argument in the common case.
-        other = torch._foreach_mul(other, alpha)
+        for t in self:
+            _check_alpha(alpha, t.dtype)
     res = foreach_binary_list(
         self,
         other,
         op.fn,
         inplace=inplace,
+        alpha=alpha,
         allowed_dtypes=op.allowed,
+        dtype_error=op.dtype_error,
+        dtype_error_type=op.dtype_error_type,
         out_dtype_fn=op.out_dtype_fn,
     )
     return None if inplace else res
@@ -221,16 +294,18 @@ def _apply_scalar(name: str, self, scalars, inplace: bool, alpha=1):
     op = BINARY_OPS[name]
     _log(name, "Scalar", inplace)
     if alpha != 1:
-        if isinstance(scalars, (list, tuple)):
-            scalars = [s * alpha for s in scalars]
-        else:
-            scalars = scalars * alpha
+        for t in self:
+            _check_alpha(alpha, t.dtype)
+    allowed = op.allowed_scalar if op.allowed_scalar is not None else op.allowed
     res = foreach_binary_scalar(
         self,
         scalars,
         op.fn,
         inplace=inplace,
-        allowed_dtypes=op.allowed,
+        alpha=alpha,
+        allowed_dtypes=allowed,
+        dtype_error=op.dtype_error,
+        dtype_error_type=op.dtype_error_type,
         out_dtype_fn=op.out_dtype_fn,
     )
     return None if inplace else res
@@ -254,11 +329,12 @@ def _apply_tensor(name: str, self, other: torch.Tensor, inplace: bool, alpha=1):
     op = BINARY_OPS[name]
     _log(name, "Tensor", inplace)
     self_list = list(self)
+    if alpha != 1:
+        for t in self_list:
+            _check_alpha(alpha, t.dtype)
     expanded = [
         other if other.shape == t.shape else other.expand_as(t) for t in self_list
     ]
-    if alpha != 1:
-        expanded = torch._foreach_mul(expanded, alpha)
     # Promotion is resolved against the *original* operand, not the expanded
     # view: ATen treats a zero-dimensional tensor as a scalar here, so an fp16
     # list times an fp32 scalar tensor stays fp16, while a genuine fp32 tensor
@@ -272,7 +348,10 @@ def _apply_tensor(name: str, self, other: torch.Tensor, inplace: bool, alpha=1):
         expanded,
         op.fn,
         inplace=inplace,
+        alpha=alpha,
         allowed_dtypes=op.allowed,
+        dtype_error=op.dtype_error,
+        dtype_error_type=op.dtype_error_type,
         out_dtypes=out_dtypes,
     )
     return None if inplace else res
@@ -353,9 +432,10 @@ def _make_ternary(name, inplace):
     return wrapper
 
 
-# ``alpha`` exists only on add/sub; giving the other wrappers the argument would
-# accept calls ATen rejects.
-_WITH_ALPHA = {"add", "sub"}
+# ``alpha`` exists on the .List overload of add/sub and on add's .Tensor form
+# only; the other overloads reject it, so handing them the argument would accept
+# calls ATen refuses.  Keyed by (operator, overload).
+_WITH_ALPHA = {("add", "List"), ("add", "Tensor"), ("sub", "List")}
 
 # Which overloads each operator actually has, from a live schema audit.  Writing
 # this table by hand from the ATen names would risk registering a key that does
@@ -380,10 +460,10 @@ _LERP_OVERLOADS = ("List", "Scalar", "ScalarList")
 _globals = globals()
 
 for _name, _ovs in _OVERLOADS.items():
-    _alpha = _name in _WITH_ALPHA
     for _inplace in (False, True):
         _suffix = "_" if _inplace else ""
         for _ov in _ovs:
+            _alpha = (_name, _ov) in _WITH_ALPHA
             if _ov == "List":
                 _fn = _make_list(_name, _inplace, _alpha)
             elif _ov == "Tensor":
@@ -462,12 +542,29 @@ for _inplace in (False, True):
 
 def _foreach_copy(self, src, non_blocking=False):
     del non_blocking
-    return _apply_list("copy", self, src, inplace=False)
+    _log("copy", "copy", False)
+    return foreach_binary_list(
+        self,
+        src,
+        _copy_fn,
+        inplace=False,
+        allowed_dtypes=BINARY_OPS["copy"].allowed,
+        copy_semantics=True,
+    )
 
 
 def _foreach_copy_(self, src, non_blocking=False):
     del non_blocking
-    return _apply_list("copy", self, src, inplace=True)
+    _log("copy", "copy", True)
+    foreach_binary_list(
+        self,
+        src,
+        _copy_fn,
+        inplace=True,
+        allowed_dtypes=BINARY_OPS["copy"].allowed,
+        copy_semantics=True,
+    )
+    return None
 
 
 def _foreach_pow_ScalarAndTensor(self, exponent):
@@ -478,6 +575,11 @@ def _foreach_pow_ScalarAndTensor(self, exponent):
     """
     _log("pow", "ScalarAndTensor", False)
     op = BINARY_OPS["pow"]
+    for t in exponent:
+        # The exponent list carries the tensors here, and ``pow`` has no bool
+        # kernel for a bool tensor operand.
+        if t.dtype == torch.bool:
+            raise NotImplementedError(_POW_BOOL_ERROR)
 
     @triton.jit
     def _rpow(a, b):
@@ -488,6 +590,8 @@ def _foreach_pow_ScalarAndTensor(self, exponent):
         self,
         _rpow,
         allowed_dtypes=op.allowed,
+        dtype_error=op.dtype_error,
+        dtype_error_type=op.dtype_error_type,
         out_dtype_fn=_float_result,
     )
 
