@@ -90,7 +90,7 @@ def _make_case(T, N, S, C, dtype):
     return gems_args, ref_args, gems_args_tensor, ref_args_tensor
 
 
-@pytest.mark.ctc_loss_backward
+@pytest.mark.underscore_ctc_loss_backward
 @pytest.mark.parametrize("T", [50] if QUICK_MODE else [50, 100])
 @pytest.mark.parametrize("N", [16] if QUICK_MODE else [16, 32])
 @pytest.mark.parametrize("S", [30] if QUICK_MODE else [20, 30])
@@ -106,7 +106,7 @@ def test__ctc_loss_backward_accuracy(T, N, S, C, dtype):
     gems_assert_close(res_grad, ref_grad, dtype)
 
 
-@pytest.mark.ctc_loss_backward
+@pytest.mark.underscore_ctc_loss_backward
 @pytest.mark.parametrize("dtype", BACKWARD_DTYPES)
 def test__ctc_loss_backward_zero_infinity(dtype):
     """zero_infinity must zero the gradient of unreachable alignments.
@@ -158,7 +158,7 @@ def test__ctc_loss_backward_zero_infinity(dtype):
     gems_assert_close(res_grad, ref_grad, dtype)
 
 
-@pytest.mark.ctc_loss_backward
+@pytest.mark.underscore_ctc_loss_backward
 @pytest.mark.parametrize("dtype", BACKWARD_DTYPES)
 def test__ctc_loss_backward_tensor_overload(dtype):
     """The .Tensor overload takes the lengths as tensors instead of int lists."""

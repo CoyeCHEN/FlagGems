@@ -70,7 +70,7 @@ class CtcLossBackwardBenchmark(base.GenericBenchmark):
         return []
 
 
-@pytest.mark.ctc_loss_backward
+@pytest.mark.underscore_ctc_loss_backward
 def test_perf__ctc_loss_backward():
     bench = CtcLossBackwardBenchmark(
         op_name="_ctc_loss_backward",
