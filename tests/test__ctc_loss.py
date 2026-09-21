@@ -120,7 +120,7 @@ def test__ctc_loss_tensor_overload(dtype):
     gems_assert_close(res_log_alpha, ref_log_alpha, dtype, reduce_dim=reduce_dim)
 
 
-@pytest.mark.underscore_ctc_loss_out
+@pytest.mark.ctc_loss_out
 @pytest.mark.parametrize("dtype", CTC_DTYPES)
 def test__ctc_loss_out(dtype):
     """The out variant writes both results in place and returns those tensors."""
@@ -142,7 +142,7 @@ def test__ctc_loss_out(dtype):
     gems_assert_close(res_out1, ref_log_alpha, dtype, reduce_dim=reduce_dim)
 
 
-@pytest.mark.underscore_ctc_loss_out
+@pytest.mark.ctc_loss_out
 @pytest.mark.parametrize("dtype", CTC_DTYPES)
 def test__ctc_loss_out_resize(dtype):
     """Empty out tensors must be resized to the produced shapes."""

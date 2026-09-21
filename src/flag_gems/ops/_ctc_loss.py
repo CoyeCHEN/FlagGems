@@ -250,7 +250,7 @@ def _ctc_loss_out(
     out1: Optional[torch.Tensor] = None,
 ):
     """Out variant of _ctc_loss."""
-    logger.debug("GEMS _CTC_LOSS OUT")
+    logger.debug("GEMS _CTC_LOSS_OUT")
 
     neg_log_likelihood, log_alpha = _ctc_loss(
         log_probs, targets, input_lengths, target_lengths, blank, zero_infinity

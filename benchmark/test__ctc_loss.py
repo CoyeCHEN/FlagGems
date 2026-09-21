@@ -77,7 +77,7 @@ def ctc_loss_internal_out_input_fn(shape, dtype, device):
         yield (*args, {**kwargs, "out0": out0, "out1": out1})
 
 
-@pytest.mark.underscore_ctc_loss_out
+@pytest.mark.ctc_loss_out
 def test_perf__ctc_loss_out():
     bench = CtcLossInternalBenchmark(
         op_name="_ctc_loss_out",
